@@ -16,19 +16,28 @@ import (
 // so we shouldn't bump this number unless there is an upgrade to wasm VM
 const MAX_ORDERS_PER_SUDO_CALL = 50000
 
-func (k *Keeper) HandleEBPlaceOrders(ctx context.Context, sdkCtx sdk.Context, tracer *otrace.Tracer, contractAddr string, registeredPairs []types.Pair) {
+func (k *Keeper) HandleEBPlaceOrders(ctx context.Context, sdkCtx sdk.Context, tracer *otrace.Tracer, contractAddr string, registeredPairs []types.Pair) error {
 	_, span := (*tracer).Start(ctx, "SudoPlaceOrders")
 	span.SetAttributes(attribute.String("contractAddr", contractAddr))
 
 	typedContractAddr := types.ContractAddress(contractAddr)
 	msgs := k.GetPlaceSudoMsg(sdkCtx, typedContractAddr, registeredPairs)
-	k.CallContractSudo(sdkCtx, contractAddr, msgs[0]) // deposit
+	_, err := k.CallContractSudo(sdkCtx, contractAddr, msgs[0]) // deposit
+	if err != nil {
+		return nil
+	}
 
 	responses := []types.SudoOrderPlacementResponse{}
 	for _, msg := range msgs[1:] {
-		data := k.CallContractSudo(sdkCtx, contractAddr, msg)
+		data, err := k.CallContractSudo(sdkCtx, contractAddr, msg)
+		if err != nil {
+			return err
+		}
 		response := types.SudoOrderPlacementResponse{}
-		json.Unmarshal(data, &response)
+		if err := json.Unmarshal(data, &response); err != nil {
+			sdkCtx.Logger().Error("Failed to parse order placement response")
+			return err
+		}
 		sdkCtx.Logger().Info(fmt.Sprintf("Sudo response data: %s", response))
 		responses = append(responses, response)
 	}
@@ -40,6 +49,7 @@ func (k *Keeper) HandleEBPlaceOrders(ctx context.Context, sdkCtx sdk.Context, tr
 		}
 	}
 	span.End()
+	return nil
 }
 
 func (k *Keeper) GetPlaceSudoMsg(ctx sdk.Context, typedContractAddr types.ContractAddress, registeredPairs []types.Pair) []types.SudoOrderPlacementMsg {
@@ -73,8 +83,18 @@ func (k *Keeper) GetDepositSudoMsg(ctx sdk.Context, typedContractAddr types.Cont
 	contractDepositInfo := []types.ContractDepositInfo{}
 	for _, depositInfo := range *k.MemState.GetDepositInfo(typedContractAddr) {
 		fund := sdk.NewCoins(sdk.NewCoin(depositInfo.Denom, depositInfo.Amount.RoundInt()))
-		if k.BankKeeper.SendCoins(ctx, sdk.AccAddress(depositInfo.Creator), sdk.AccAddress(typedContractAddr), fund) == nil {
+		sender, err := sdk.AccAddressFromBech32(depositInfo.Creator)
+		if err != nil {
+			ctx.Logger().Error("Invalid deposit creator")
+		}
+		receiver, err := sdk.AccAddressFromBech32(string(typedContractAddr))
+		if err != nil {
+			ctx.Logger().Error("Invalid deposit contract")
+		}
+		if err := k.BankKeeper.SendCoins(ctx, sender, receiver, fund); err == nil {
 			contractDepositInfo = append(contractDepositInfo, dexcache.ToContractDepositInfo(depositInfo))
+		} else {
+			ctx.Logger().Error(err.Error())
 		}
 	}
 	return types.SudoOrderPlacementMsg{
